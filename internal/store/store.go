@@ -1828,8 +1828,10 @@ var learningHeaderPattern = regexp.MustCompile(
 	`(?im)^#{2,3}\s+(?:Aprendizajes(?:\s+Clave)?|Key\s+Learnings?|Learnings?):?\s*$`,
 )
 
-// minLearningLength is the minimum character length for a learning to be valid.
-const minLearningLength = 20
+const (
+	minLearningLength = 20
+	minLearningWords  = 4
+)
 
 // ExtractLearnings parses structured learning items from text.
 // It looks for sections like "## Key Learnings:" or "## Aprendizajes Clave:"
@@ -1858,7 +1860,7 @@ func ExtractLearnings(text string) []string {
 		if len(numbered) > 0 {
 			for _, m := range numbered {
 				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength {
+				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
 					learnings = append(learnings, cleaned)
 				}
 			}
@@ -1869,7 +1871,7 @@ func ExtractLearnings(text string) []string {
 			bullets := regexp.MustCompile(`(?m)^\s*[-*]\s+(.+)`).FindAllStringSubmatch(sectionText, -1)
 			for _, m := range bullets {
 				cleaned := cleanMarkdown(m[1])
-				if len(cleaned) >= minLearningLength {
+				if len(cleaned) >= minLearningLength && len(strings.Fields(cleaned)) >= minLearningWords {
 					learnings = append(learnings, cleaned)
 				}
 			}
