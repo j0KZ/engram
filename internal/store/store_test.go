@@ -4439,3 +4439,227 @@ func TestCountObservationsForProject(t *testing.T) {
 		t.Errorf("expected 0 for beta, got %d", count)
 	}
 }
+
+// ─── DeleteSession tests ─────────────────────────────────────────────────────
+
+func TestDeleteSession_EmptySession(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-empty", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	if err := s.DeleteSession("sess-empty"); err != nil {
+		t.Fatalf("expected no error deleting empty session, got: %v", err)
+	}
+
+	// Session should be gone.
+	sessions, err := s.RecentSessions("proj", 10)
+	if err != nil {
+		t.Fatalf("recent sessions: %v", err)
+	}
+	for _, ss := range sessions {
+		if ss.ID == "sess-empty" {
+			t.Fatal("expected session to be deleted but it still exists")
+		}
+	}
+}
+
+func TestDeleteSession_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DeleteSession("does-not-exist")
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got: %v", err)
+	}
+}
+
+func TestDeleteSession_HasActiveObservations(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-has-obs", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-has-obs",
+		Type:      "decision",
+		Title:     "some decision",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	}); err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+
+	err := s.DeleteSession("sess-has-obs")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations, got: %v", err)
+	}
+}
+
+func TestDeleteSession_HasSoftDeletedObservations(t *testing.T) {
+	// Even soft-deleted observations must block the session delete
+	// to avoid FK constraint violations.
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-soft", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	obsID, err := s.AddObservation(AddObservationParams{
+		SessionID: "sess-soft",
+		Type:      "decision",
+		Title:     "soft deleted obs",
+		Content:   "content",
+		Project:   "proj",
+		Scope:     "project",
+	})
+	if err != nil {
+		t.Fatalf("add observation: %v", err)
+	}
+	if err := s.DeleteObservation(obsID, false); err != nil {
+		t.Fatalf("soft delete observation: %v", err)
+	}
+
+	err = s.DeleteSession("sess-soft")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations for soft-deleted obs, got: %v", err)
+	}
+}
+
+func TestDeleteSession_DeletesPromptsAlso(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-with-prompts", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-with-prompts",
+		Content:   "a prompt",
+		Project:   "proj",
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	if err := s.DeleteSession("sess-with-prompts"); err != nil {
+		t.Fatalf("delete session: %v", err)
+	}
+
+	prompts, err := s.RecentPrompts("proj", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected prompts to be deleted with session, got %d", len(prompts))
+	}
+}
+
+func TestDeleteSession_FKConstraintFallback(t *testing.T) {
+	// Verify that a SQLite FK constraint error on the DELETE FROM sessions
+	// statement is translated into ErrSessionHasObservations.
+	//
+	// SQLite is a single-writer database, so it is not possible to inject an
+	// observation from a concurrent connection while the transaction already
+	// holds the write lock. Instead we simulate the race by:
+	//   1. Pre-inserting an observation directly (bypassing store logic).
+	//   2. Mocking the queryIt hook so the COUNT query returns 0 (as if the
+	//      observation arrived after the count).
+	//   3. Letting DeleteSession proceed; the DELETE FROM sessions then fails
+	//      with a real SQLite FK constraint error (SQLITE_CONSTRAINT_FOREIGNKEY).
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-race", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	// Insert the observation directly, bypassing the store COUNT guard.
+	if _, err := s.db.Exec(`
+		INSERT INTO observations
+			(session_id, type, title, content, project, scope, created_at, updated_at, sync_id, duplicate_count, revision_count)
+		VALUES
+			('sess-race', 'decision', 'race obs', 'content', 'proj', 'project',
+			 datetime('now'), datetime('now'), 'sync-race-1', 1, 1)`); err != nil {
+		t.Fatalf("pre-insert observation: %v", err)
+	}
+
+	// Mock queryIt so the COUNT returns 0, simulating the race window where the
+	// observation did not exist when the count ran.
+	origQueryIt := s.hooks.queryIt
+	faked := false
+	s.hooks.queryIt = func(db queryer, query string, args ...any) (rowScanner, error) {
+		if !faked && strings.Contains(query, "COUNT(*)") && strings.Contains(query, "observations WHERE session_id") {
+			faked = true
+			// Return a scanner that always yields count = 0.
+			return &fakeCountScanner{}, nil
+		}
+		return origQueryIt(db, query, args...)
+	}
+	defer func() { s.hooks = defaultStoreHooks() }()
+
+	err := s.DeleteSession("sess-race")
+	if !errors.Is(err, ErrSessionHasObservations) {
+		t.Fatalf("expected ErrSessionHasObservations from FK constraint, got: %v", err)
+	}
+}
+
+// fakeCountScanner is a rowScanner that yields a single row with value 0,
+// used to simulate a COUNT(*) result of zero.
+type fakeCountScanner struct {
+	done bool
+}
+
+func (f *fakeCountScanner) Next() bool {
+	if f.done {
+		return false
+	}
+	f.done = true
+	return true
+}
+func (f *fakeCountScanner) Scan(dest ...any) error {
+	if len(dest) > 0 {
+		if p, ok := dest[0].(*int); ok {
+			*p = 0
+		}
+	}
+	return nil
+}
+func (f *fakeCountScanner) Err() error   { return nil }
+func (f *fakeCountScanner) Close() error { return nil }
+
+// ─── DeletePrompt tests ──────────────────────────────────────────────────────
+
+func TestDeletePrompt_Success(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.CreateSession("sess-p", "proj", "/tmp"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	id, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sess-p",
+		Content:   "delete me",
+		Project:   "proj",
+	})
+	if err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+
+	if err := s.DeletePrompt(id); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	prompts, err := s.RecentPrompts("proj", 10)
+	if err != nil {
+		t.Fatalf("recent prompts: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("expected prompt to be deleted, got %d", len(prompts))
+	}
+}
+
+func TestDeletePrompt_NotFound(t *testing.T) {
+	s := newTestStore(t)
+
+	err := s.DeletePrompt(999999)
+	if !errors.Is(err, ErrPromptNotFound) {
+		t.Fatalf("expected ErrPromptNotFound, got: %v", err)
+	}
+}

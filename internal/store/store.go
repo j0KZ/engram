@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,10 +20,22 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 var openDB = sql.Open
+
+// sqliteConstraintForeignKey is the extended SQLite result code for a foreign-key
+// constraint violation (SQLITE_CONSTRAINT_FOREIGNKEY = 787).
+// See https://www.sqlite.org/rescode.html#constraint_foreignkey
+const sqliteConstraintForeignKey = 787
+
+// Sentinel errors returned by delete operations so callers can use errors.Is.
+var (
+	ErrSessionNotFound        = errors.New("session not found")
+	ErrSessionHasObservations = errors.New("session still has observations")
+	ErrPromptNotFound         = errors.New("prompt not found")
+)
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1216,6 +1229,87 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		results = append(results, p)
 	}
 	return results, rows.Err()
+}
+
+// ─── Delete Session ──────────────────────────────────────────────────────────
+
+// DeleteSession hard-deletes a session and its prompts.
+// It returns ErrSessionHasObservations if the session has any observations
+// (including soft-deleted ones) to prevent orphaned rows.
+// It returns ErrSessionNotFound if no session with that ID exists.
+//
+// Note: this delete only removes local rows. It does not enqueue a delete
+// sync mutation, but any previously enqueued mutations for the session or its
+// prompts may still be synced later if autosync is enabled, and a later pull
+// may recreate the deleted rows locally.
+func (s *Store) DeleteSession(id string) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		// Count ALL observations for the session, including soft-deleted ones,
+		// because the FK constraint on observations.session_id has no ON DELETE CASCADE.
+		var count int
+		rows, err := s.queryItHook(tx, `SELECT COUNT(*) FROM observations WHERE session_id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete session: count observations: %w", err)
+		}
+		if rows.Next() {
+			if err := rows.Scan(&count); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("delete session: count observations: %w", err)
+			}
+		}
+		_ = rows.Close()
+		if count > 0 {
+			return fmt.Errorf("%w: session %q has %d observation(s)", ErrSessionHasObservations, id, count)
+		}
+
+		if _, err := s.execHook(tx, `DELETE FROM user_prompts WHERE session_id = ?`, id); err != nil {
+			return fmt.Errorf("delete session: remove prompts: %w", err)
+		}
+
+		res, err := s.execHook(tx, `DELETE FROM sessions WHERE id = ?`, id)
+		if err != nil {
+			var sqliteErr *sqlite.Error
+			if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqliteConstraintForeignKey {
+				return fmt.Errorf("%w: session %q has observation(s)", ErrSessionHasObservations, id)
+			}
+			return fmt.Errorf("delete session: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete session: rows affected: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %q", ErrSessionNotFound, id)
+		}
+
+		return nil
+	})
+}
+
+// ─── Delete Prompt ───────────────────────────────────────────────────────────
+
+// DeletePrompt hard-deletes a single prompt by ID.
+// It returns ErrPromptNotFound if no prompt with that ID exists.
+//
+// Note: this delete only removes local rows. It does not enqueue a delete
+// sync mutation, but any previously enqueued mutations for the prompt
+// may still be synced later if autosync is enabled, and a later pull
+// may recreate the deleted row locally.
+func (s *Store) DeletePrompt(id int64) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		res, err := s.execHook(tx, `DELETE FROM user_prompts WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("delete prompt: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("delete prompt: rows affected: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: prompt #%d", ErrPromptNotFound, id)
+		}
+		return nil
+	})
 }
 
 // ─── Get Single Observation ──────────────────────────────────────────────────

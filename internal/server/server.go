@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -101,6 +102,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /sessions", s.handleCreateSession)
 	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 
 	// Observations
 	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
@@ -120,6 +122,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
+	s.mux.HandleFunc("DELETE /prompts/{id}", s.handleDeletePrompt)
 
 	// Context
 	s.mux.HandleFunc("GET /context", s.handleContext)
@@ -426,6 +429,50 @@ func (s *Server) handleSearchPrompts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, http.StatusOK, prompts)
+}
+
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		jsonError(w, http.StatusBadRequest, "session id is required")
+		return
+	}
+
+	if err := s.store.DeleteSession(id); err != nil {
+		switch {
+		case errors.Is(err, store.ErrSessionHasObservations):
+			jsonError(w, http.StatusConflict, err.Error())
+		case errors.Is(err, store.ErrSessionNotFound):
+			jsonError(w, http.StatusNotFound, err.Error())
+		default:
+			jsonError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// local-only delete: do not notify autosync to avoid triggering a pull
+	// that could recreate the deleted rows from a remote store.
+	jsonResponse(w, http.StatusOK, map[string]string{"id": id, "status": "deleted"})
+}
+
+func (s *Server) handleDeletePrompt(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, "invalid prompt id")
+		return
+	}
+
+	if err := s.store.DeletePrompt(id); err != nil {
+		if errors.Is(err, store.ErrPromptNotFound) {
+			jsonError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	jsonResponse(w, http.StatusOK, map[string]any{"id": id, "status": "deleted"})
 }
 
 // ─── Export / Import ─────────────────────────────────────────────────────────
